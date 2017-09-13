@@ -1,0 +1,91 @@
+<?php
+/**
+ * 简历算法
+ * 每个库  5000000条数据  5000 页
+ *
+ * 先刷 education
+ *
+ */
+
+namespace Swoole\App\Refresh;
+use Swoole\Core\Log;
+use Swoole\Core\Helper\System;
+use Swoole\Core\Helper\File;
+class Refresh extends \Swoole\Core\App\Controller{
+    private $db;
+    private $config;
+    private $page_size = 1000;
+    private $page = 1;
+    private $page_count=0;
+    private $status = 0; //进行状态  0 进行中   1 完成
+    private $file_name;
+    private $init_id;
+
+    public function init(){
+        $this->db = $this->db("icdc_".$this->swoole->worker_id);
+        $this->file_name = SWOOLE_ROOT_DIR."log/".SWOOLE_APP.'/icdc_'.$this->swoole->worker_id.'.page';
+        //要刷哪个字段放开哪个字段
+        $this->config = array(
+//            'education' =>  'cv_education_service_online',  //  cv_education、cv_degree
+            'work'      =>  'corp_tag',                     //  cv_trade
+        );
+
+//        if(file_exists($this->file_name)){
+//            $arr = unserialize(File::read_file($this->file_name));
+//
+//        }
+
+    }
+
+
+    /** 简历算法表刷库操作
+     * @param int $id 如果有id那么是单个刷库测试
+     * @return bool
+     */
+    public function start($id=0,$icdc_num=0){
+        if((int)$id > 0 && $this->swoole->worker_id == $icdc_num){
+            $this->init();
+            $this->page = 1;
+            $this->page_count = 1;
+            Log::write_log("$id 在 icdc_$icdc_num 库中,开始单刷$id...");
+            $this->init_id = $id;
+            $this->send_task();
+        }elseif($id==0 && $icdc_num==0){
+            $this->init();
+            if(empty($this->page_count)){
+                $result = $this->db->query("select count(1) as `count` from resumes")->fetch_assoc();
+                $this->page_count= ceil($result['count'] / $this->page_size);
+            }
+            System::exec_time();
+            for ($i = 0; $i <= 5; $i++) {
+                $this->send_task();
+            }
+        }
+    }
+
+    public function send_task(){
+        $task_id = $this->task(array(
+            'id' => $this->init_id,
+            'db' => "icdc_".$this->swoole->worker_id,
+            'page' => $this->page,
+            'page_count' => $this->page_count,
+            'page_size' => $this->page_size,
+            'field' => $this->config,
+        ),function($response,$request){
+            $request['current_page']=$response['current_page'];
+            $request['status'] = $this->status;
+            $request['time'] = date('Y-m-d H:i:s');
+            File::write_file($this->file_name,serialize($request));
+            $this->page++;
+            if($this->page <= $this->page_count){
+                $this->send_task();
+            }elseif($response['current_page'] == $this->page_count){
+                Log::write_log("icdc_{$this->swoole->worker_id} 更新完成，用时： " . System::exec_time() . " ms, 内存使用： " . System::get_used_memory());
+            }
+        });
+
+        if ($task_id === false) {
+            Log::write_log("[icdc_{$this->swoole->worker_id}] 第 {$this->page} 页 send failed ......");
+        }
+    }
+}

@@ -1,0 +1,196 @@
+<?php
+/**
+ * 处理数据库中简历数据中birth： 
+ * “xx 年01月01日” OR  “xx 年1月1日”  OR  “xx 年01月1日” OR  “xx 年1月01日” 
+ * 数据修改成  “xx年” 
+ */
+namespace Swoole\App\MM;
+use \PDO;
+use \RedisCluster;
+class MMTask extends \Swoole\Core\App\Controller{
+
+    private $db;
+    private $redis;
+    private $db_name;
+
+    public function init(){
+
+    }
+
+    public function index($mm){
+        $this->redis = new RedisCluster(NULL,['192.168.8.116:7105','192.168.8.115:7105','192.168.8.114:7105','192.168.8.113:7105','192.168.8.116:7106','192.168.8.115:7106',
+                '192.168.8.114:7106','192.168.8.113:7106','192.168.8.116:7107','192.168.8.115:7107','192.168.8.114:7107','192.168.8.113:7107',
+                '192.168.8.116:7108','192.168.8.115:7108','192.168.8.114:7108','192.168.8.113:7108']);
+
+
+        $this->apiinit("tag_predict");
+        
+        $this->db = new PDO('mysql:host='.$mm['host'], 'icdc', 'rg62fnme2d68t9cmd3d', array(PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES \'UTF8\''));
+        $this->db_name = $mm['key'];
+
+        $ids = implode(',',$mm['ids']);
+        $result = $this->db->query("select a.id,a.compress,b.updated_at from {$this->db_name}.resumes_extras as a,{$this->db_name}.algorithms as b where a.id=b.id and a.id in($ids)")->fetchAll(PDO::FETCH_ASSOC);
+        
+        foreach ($result as $resume){
+            $this->algorithm($resume);
+        }
+
+        $this->db=null;
+        $this->redis->close();
+        return true;
+    }
+
+    private function algorithm($extra){
+        $redis_data=[]; 
+        $save_data=[];
+        $is_update_resume_extra=false;
+        
+        if(empty($extra)){
+            return;
+        }
+
+        $resume_id = (int)$extra['id'];
+        if($resume_id <= 0){
+            return;
+        }
+
+        if($extra['updated_at'] > '2017-07-12 00:00:00'){
+            return;
+        }
+
+        $compress = json_decode(gzuncompress($extra['compress']), true);
+        if(empty($compress)){
+            return;
+        }
+
+        if($compress['basic']['is_deleted'] == 'Y'){
+            return;
+        }
+
+        if(empty($compress['basic']['id'])){
+            $compress['basic']['id'] = $resume_id;
+            $this->is_update_resume_extra = true;
+        }
+
+        
+
+        $res = $this->cv_tag($compress);
+        if($res === null){
+            return;
+        }
+
+        $redis_data['cv_tag'] = $save_data['cv_tag'] = $res;
+        
+
+        
+        
+        //存储redis数据
+        if(!empty($redis_data)){
+           $redis_data['updated_at']=date('Y-m-d H:i:s');
+           $this->redis->hMset($resume_id,$redis_data);
+        }
+
+        //存储mysql数据
+        if(!empty($save_data)){
+            $this->save($resume_id,$save_data);
+        }
+    }
+
+    private function save($resume_id,$algorithms){
+
+        $algorithm = '';
+        foreach($algorithms as $key=>$value){
+            $algorithm .= "'$key','".addslashes($value)."',";
+        }
+        $algorithm = rtrim($algorithm,',');
+        if(empty($algorithm)) return;
+        $time = date("Y-m-d H:i:s");
+        $sql = "update {$this->db_name}.algorithms set data=column_add(data,$algorithm),updated_at='$time' where id=$resume_id";
+        $this->db->exec($sql);
+        error_log($sql."\n",3,"/opt/log/cv_tag_sql".date("Y-m-d"));
+    }
+
+    private function cv_tag($compress){
+        if(empty($compress['work'])) return '';
+        $work_list = array();
+        foreach ($compress['work'] as $work){
+            $work_id = $work['id'];
+            if (empty($work['position_name']) && empty($work['responsibilities'])) continue;
+            $work_list[$work_id] = array(
+                'id'    => $work_id,
+                'type'  => 0,
+                'title' => empty($work['position_name']) ? '' : $work['position_name'],
+                'desc'  => empty($work['responsibilities']) ? '' : $work['responsibilities']
+            );
+        }
+
+        if(empty($work_list)) return '';
+
+        $success = @$this->tag_predict->ping('data testing');
+        if (!$success) {
+            $this->apiinit("tag_predict");
+        }
+
+        $param=array(
+            'header'=>$this->header(),
+            'request'=>array(
+                'c' => 'cv_tag',
+                'm' => 'get_cv_tags',
+                'p' => array(
+                    'cv_id' => $compress['basic']['id'],
+                    'work_map' => $work_list
+                )
+            )
+        );
+
+        $return = $this->tag_predict->doNormal("tag_predict",json_encode($param));
+        $rs = msgpack_unpack($return);
+
+        
+        if(isset($rs['response']['results'])){
+            return empty($rs['response']['results']) ? '' : json_encode($rs['response']['results'],JSON_UNESCAPED_UNICODE);
+        }else{
+            error_log($idss,3,"/opt/log/cv_tag_timeout_ids");
+            return null;
+        }
+    }
+
+    /**
+     * 初始化接口连接
+     * @param  [type] $api [description]
+     * @return [type]      [description]
+     */
+    private function apiinit($api){
+        $this->$api = new \GearmanClient();
+        $config_text = json_decode(file_get_contents("/opt/wwwroot/conf/gm.conf"),true);
+        if (isset($config_text[$api]) && $config_text[$api]['host']){
+            foreach ($config_text[$api]['host'] as $host){
+                $this->$api->addServers($host);
+            }
+        }
+    }
+    
+    /**
+     * [header description]
+     * @return [type] [description]
+     */
+    private function header(){
+        return array(
+            'product_name'  =>  $param['product_name'] ?? 'BIService',
+            'uid'           =>  $param['uid'] ?? '9',
+            'session_id'    =>  $param['session_id'] ?? '0',
+            'uname'         =>  $param['uname'] ?? 'BIServer',
+            'version'       =>  $param['version'] ?? '0.1',
+            'signid'        =>  $param['signid'] ?? 0,
+            'provider'      =>  $param['provider'] ?? 'icdc',
+            'ip'            =>  $param['ip'] ?? '0.0.0.0',
+            'user_ip'       =>  $param['user_ip'] ?? '0.0.0.0',
+            'local_ip'      =>  $param['local_ip'] ?? '0.0.0.0',
+            'log_id'        =>  $param['log_id'] ?? uniqid('bi_'),
+            'appid'         =>  $param['appid'] ?? 999,
+        );
+    }
+
+
+
+}

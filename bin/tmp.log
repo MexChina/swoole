@@ -1,0 +1,6 @@
+==40073== Memcheck, a memory error detector
+==40073== Copyright (C) 2002-2015, and GNU GPL'd, by Julian Seward et al.
+==40073== Using Valgrind-3.11.0 and LibVEX; rerun with -h for copyright info
+==40073== Command: php tmp.php
+==40073== Parent PID: 3824
+==40073== 
